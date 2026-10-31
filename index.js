@@ -17,31 +17,41 @@ const db = {
   users: [
     { email: 'yousafcodes.de@gmail.com', pass: 'YOUSAFCODES.DE', role: 'admin', name: 'Oggy Admin', status: 'active' }
   ],
-  // Sites are now objects: { domain: 'shop.com', price: '1.99', currency: 'USD' }
   sites: [
-    { domain: 'shopify.com', price: '29.00', currency: 'USD' },
-    { domain: 'checkout.com', price: 'N/A', currency: '' }
+    { domain: 'shopify.com', price: '29.00', currency: 'USD' }
   ],
   proxies: [],
   inbox: [],
   activity: []
 };
 
-// ─── PROXY FORMATTER ───
+// ─── BULLETPROOF PROXY FORMATTER ───
 function formatProxy(proxyStr) {
   if (!proxyStr) return null;
   let p = proxyStr.trim();
-  if (p.startsWith('http://') || p.startsWith('https://')) return p;
   
+  // Strip any existing protocols to start fresh
+  p = p.replace(/^(socks5|socks4|http|https):\/\//i, '');
+
+  // Case 1: user:pass@ip:port
   if (p.includes('@')) {
     return `http://${p}`;
   }
   
   const parts = p.split(':');
+  
+  // Case 2: ip:port:user:pass
+  if (parts.length === 4) {
+    return `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
+  }
+  
+  // Case 3: ip:port
   if (parts.length === 2) {
     return `http://${parts[0]}:${parts[1]}`;
   }
-  return null;
+  
+  // Fallback
+  return `http://${p}`;
 }
 
 // ─── AUTH & USER MANAGEMENT ───
@@ -105,7 +115,6 @@ app.post('/api/check-sites', async (req, res) => {
       let cheapestPrice = 'N/A';
       let currency = '';
 
-      // 1. Try to find cheapest product via products.json
       try {
         const prodRes = await axios.get(`https://${domain}/products.json?limit=250`, options);
         if (prodRes.status === 200 && prodRes.data && Array.isArray(prodRes.data.products) && prodRes.data.products.length > 0) {
@@ -114,15 +123,12 @@ app.post('/api/check-sites', async (req, res) => {
             if (prod.variants) {
               prod.variants.forEach(v => {
                 const p = parseFloat(v.price);
-                if (!isNaN(p) && p < minPrice && p > 0) {
-                  minPrice = p;
-                }
+                if (!isNaN(p) && p < minPrice && p > 0) minPrice = p;
               });
             }
           });
           if (minPrice !== Infinity) {
             cheapestPrice = minPrice.toFixed(2);
-            // Try to get currency from homepage (products.json doesn't always include it)
             try {
               const homeRes = await axios.get(`https://${domain}`, options);
               const match = homeRes.data.match(/Shopify\.currency\s*=\s*["']?([A-Z]{3})["']?/);
@@ -130,47 +136,23 @@ app.post('/api/check-sites', async (req, res) => {
             } catch(e) {}
           }
         }
-      } catch (err) {
-        // products.json failed, try fallback
-      }
+      } catch (err) {}
 
-      // 2. Verify it's Shopify (GraphQL or Headers)
       try {
-        // Check GraphQL endpoint (often exists on Shopify)
-        const gqlRes = await axios.post(`https://${domain}/api/graphql`, {
-          query: `{ shop { name } }`
-        }, options);
-        
+        const gqlRes = await axios.post(`https://${domain}/api/graphql`, { query: `{ shop { name } }` }, options);
         if (gqlRes.status === 200 && gqlRes.data) {
-          console.log(`[Site OK] ${domain} (GraphQL) - Min Price: ${cheapestPrice}`);
           return { domain, price: cheapestPrice, currency };
         }
       } catch (gqlErr) {
-        // GraphQL failed, check headers
         try {
           const homeRes = await axios.get(`https://${domain}`, options);
           const headers = homeRes.headers;
           const body = homeRes.data;
-          
-          const isShopify = 
-            headers['x-shopid'] !== undefined || 
-            headers['x-shopify-stage'] !== undefined ||
-            (typeof body === 'string' && (body.includes('cdn.shopify.com') || body.includes('Shopify.theme')));
-            
+          const isShopify = headers['x-shopid'] !== undefined || headers['x-shopify-stage'] !== undefined || (typeof body === 'string' && (body.includes('cdn.shopify.com') || body.includes('Shopify.theme')));
           if (homeRes.status === 200 && isShopify) {
-            // Try to parse price from JSON-LD if products.json failed
-            if (cheapestPrice === 'N/A' && typeof body === 'string') {
-              const jsonLdMatch = body.match(/"price":\s*"?([0-9.]+)"?/);
-              if (jsonLdMatch && jsonLdMatch[1]) {
-                cheapestPrice = parseFloat(jsonLdMatch[1]).toFixed(2);
-              }
-            }
-            console.log(`[Site OK] ${domain} (Headers) - Min Price: ${cheapestPrice}`);
             return { domain, price: cheapestPrice, currency };
           }
-        } catch (e2) {
-          // Dead
-        }
+        } catch (e2) {}
         return null;
       }
     }));
@@ -178,13 +160,11 @@ app.post('/api/check-sites', async (req, res) => {
     results.forEach(r => { if (r) liveSites.push(r); });
   }
 
-  // Merge avoiding duplicates
   const existingDomains = db.sites.map(s => s.domain);
   liveSites.forEach(newSite => {
     if (!existingDomains.includes(newSite.domain)) {
       db.sites.push(newSite);
     } else {
-      // Update existing site price
       const idx = db.sites.findIndex(s => s.domain === newSite.domain);
       if (idx !== -1) db.sites[idx] = newSite;
     }
@@ -210,28 +190,22 @@ app.post('/api/check-proxies', async (req, res) => {
 
   const liveProxies = [];
   
-  // Test 20 at a time
   for (let i = 0; i < proxies.length; i += 20) {
     const batch = proxies.slice(i, i + 20);
     const results = await Promise.all(batch.map(async (p) => {
       const start = Date.now();
       const formatted = formatProxy(p);
-      if (!formatted) return null;
       
       try {
         const agent = new HttpsProxyAgent(formatted);
-        // Hit a fast, reliable endpoint
-        const response = await axios.get('https://1.1.1.1/cdn-cgi/trace', { 
+        await axios.get('https://api.ipify.org?format=json', { 
           httpsAgent: agent, 
-          timeout: 5000 
+          timeout: 10000 
         });
         
-        if (response.status === 200) {
-          const ms = Date.now() - start;
-          if (ms <= 5000) {
-            console.log(`[Proxy OK] ${p} (${ms}ms)`);
-            return p;
-          }
+        const ms = Date.now() - start;
+        if (ms <= 10000) {
+          return p; // Keep original format for the API
         }
         return null;
       } catch (err) {
@@ -275,7 +249,6 @@ app.get('/api/check', async (req, res) => {
       proxyUrl = formatProxy(proxyStr);
     }
 
-    // Pick random site from objects
     const siteObj = db.sites.length > 0 ? db.sites[Math.floor(Math.random() * db.sites.length)] : { domain: 'shopify.com' };
     const site = siteObj.domain;
 
