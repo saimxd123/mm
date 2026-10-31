@@ -29,28 +29,11 @@ const db = {
 function formatProxy(proxyStr) {
   if (!proxyStr) return null;
   let p = proxyStr.trim();
-  
-  // Strip any existing protocols to start fresh
   p = p.replace(/^(socks5|socks4|http|https):\/\//i, '');
-
-  // Case 1: user:pass@ip:port
-  if (p.includes('@')) {
-    return `http://${p}`;
-  }
-  
+  if (p.includes('@')) return `http://${p}`;
   const parts = p.split(':');
-  
-  // Case 2: ip:port:user:pass
-  if (parts.length === 4) {
-    return `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
-  }
-  
-  // Case 3: ip:port
-  if (parts.length === 2) {
-    return `http://${parts[0]}:${parts[1]}`;
-  }
-  
-  // Fallback
+  if (parts.length === 4) return `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
+  if (parts.length === 2) return `http://${parts[0]}:${parts[1]}`;
   return `http://${p}`;
 }
 
@@ -86,7 +69,7 @@ app.post('/api/settings', (req, res) => {
   res.json({ success: true });
 });
 
-// ─── ADMIN: SITE CHECKER & MANAGER ───
+// ─── ADMIN: SITE CHECKER ───
 app.get('/api/sites', (req, res) => res.json(db.sites));
 
 app.post('/api/check-sites', async (req, res) => {
@@ -102,9 +85,7 @@ app.post('/api/check-sites', async (req, res) => {
       if (!domain) return null;
       
       let proxyStr = null;
-      if (db.proxies.length > 0) {
-        proxyStr = db.proxies[Math.floor(Math.random() * db.proxies.length)];
-      }
+      if (db.proxies.length > 0) proxyStr = db.proxies[Math.floor(Math.random() * db.proxies.length)];
       
       const options = { timeout: 15000 };
       if (proxyStr) {
@@ -162,9 +143,8 @@ app.post('/api/check-sites', async (req, res) => {
 
   const existingDomains = db.sites.map(s => s.domain);
   liveSites.forEach(newSite => {
-    if (!existingDomains.includes(newSite.domain)) {
-      db.sites.push(newSite);
-    } else {
+    if (!existingDomains.includes(newSite.domain)) db.sites.push(newSite);
+    else {
       const idx = db.sites.findIndex(s => s.domain === newSite.domain);
       if (idx !== -1) db.sites[idx] = newSite;
     }
@@ -181,7 +161,7 @@ app.delete('/api/sites', (req, res) => {
   res.json({ success: true, removed: before - db.sites.length, total: db.sites.length });
 });
 
-// ─── ADMIN: PROXY CHECKER & MANAGER ───
+// ─── ADMIN: PROXY CHECKER ───
 app.get('/api/proxies', (req, res) => res.json(db.proxies));
 
 app.post('/api/check-proxies', async (req, res) => {
@@ -195,24 +175,13 @@ app.post('/api/check-proxies', async (req, res) => {
     const results = await Promise.all(batch.map(async (p) => {
       const start = Date.now();
       const formatted = formatProxy(p);
-      
       try {
         const agent = new HttpsProxyAgent(formatted);
-        await axios.get('https://api.ipify.org?format=json', { 
-          httpsAgent: agent, 
-          timeout: 10000 
-        });
-        
-        const ms = Date.now() - start;
-        if (ms <= 10000) {
-          return p; // Keep original format for the API
-        }
+        await axios.get('https://api.ipify.org?format=json', { httpsAgent: agent, timeout: 10000 });
+        if (Date.now() - start <= 10000) return p;
         return null;
-      } catch (err) {
-        return null;
-      }
+      } catch (err) { return null; }
     }));
-    
     results.forEach(r => { if (r) liveProxies.push(r); });
   }
 
@@ -239,7 +208,6 @@ app.get('/api/check', async (req, res) => {
 
   while (attempts < maxAttempts) {
     attempts++;
-    
     let proxyStr = null;
     let proxyUrl = null;
 
@@ -253,41 +221,27 @@ app.get('/api/check', async (req, res) => {
     const site = siteObj.domain;
 
     const targetUrl = new URL('https://check.yzio.app/shopify');
-    
     targetUrl.searchParams.append('site', site);
     targetUrl.searchParams.append('cc', cc);
-    
-    if (db.apiKey && db.apiKey.trim() !== '') {
-      targetUrl.searchParams.append('key', db.apiKey.trim());
-    }
-    if (proxyStr) {
-      targetUrl.searchParams.append('proxy', proxyStr);
-    }
+    if (db.apiKey && db.apiKey.trim() !== '') targetUrl.searchParams.append('key', db.apiKey.trim());
+    if (proxyStr) targetUrl.searchParams.append('proxy', proxyStr);
 
     try {
       const options = { timeout: 20000 };
       if (proxyUrl) options.httpsAgent = new HttpsProxyAgent(proxyUrl);
-      
       const response = await axios.get(targetUrl.toString(), options);
       return res.json(response.data);
-
     } catch (err) {
       lastError = err.message;
-      
-      if (proxyStr && (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT' || err.message.includes('connect') || err.message.includes('ECONNREFUSED'))) {
+      if (proxyStr && (err.code === 'ECONNABORTED' || err.message.includes('connect'))) {
         db.proxies = db.proxies.filter(p => p !== proxyStr);
-        console.log(`[Proxy Dead] Removed ${proxyStr} - Retrying...`);
       }
     }
   }
-
-  res.status(500).json({ 
-    status: 'ERROR', 
-    message: `Failed after ${attempts} attempts. ${lastError}` 
-  });
+  res.status(500).json({ status: 'ERROR', message: `Failed. ${lastError}` });
 });
 
-// ─── REPORTING & INBOX ───
+// ─── REPORTING & ACTIVITY (PRIVACY FIX) ───
 app.post('/api/report', (req, res) => {
   const { user, cc, message } = req.body;
   db.inbox.unshift({ user, cc, message, time: new Date().toISOString() });
@@ -303,8 +257,19 @@ app.post('/api/activity', (req, res) => {
   res.json({ success: true });
 });
 
+// Only returns the logged-in user's data, unless they are admin
 app.get('/api/admin/data', (req, res) => {
-  res.json({ inbox: db.inbox, activity: db.activity });
+  const email = req.query.email;
+  let inbox = db.inbox;
+  let activity = db.activity;
+
+  // If the user requesting is not the admin, filter the logs
+  if (email && email !== 'yousafcodes.de@gmail.com') {
+    inbox = inbox.filter(i => i.user === email);
+    activity = activity.filter(a => a.user === email);
+  }
+
+  res.json({ inbox, activity });
 });
 
 // ─── SERVE FRONTEND ───
