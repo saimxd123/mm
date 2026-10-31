@@ -14,7 +14,7 @@ app.use(express.static(__dirname));
 // ─── GLOBAL MEMORY DATABASE ───
 const db = {
   users: [
-    { email: 'yousafcodes.de@gmail.com', pass: 'YOUSAFCODES.DE', role: 'admin', name: 'Oggy Admin', status: 'active', checked: 0 }
+    { email: 'yousafcodes.de@gmail.com', pass: 'YOUSAFCODES.DE', role: 'admin', name: 'Oggy Admin', status: 'active' }
   ],
   sites: ['shopify.com', 'checkout.com'],
   proxies: [],
@@ -35,7 +35,7 @@ app.get('/api/users', (req, res) => res.json(db.users));
 app.post('/api/register', (req, res) => {
   const { email, password, name, role } = req.body;
   if (db.users.find(u => u.email === email)) return res.status(400).json({ error: 'Email exists' });
-  db.users.push({ email, pass: password, name, role: role || 'user', status: 'active', checked: 0 });
+  db.users.push({ email, pass: password, name, role, status: 'active', checked: 0 });
   res.json({ success: true });
 });
 
@@ -50,46 +50,73 @@ app.post('/api/user/delete', (req, res) => {
   res.json({ success: true });
 });
 
-// ─── ADMIN: SITES ───
+// ─── ADMIN: SITES MANAGEMENT ───
 app.get('/api/sites', (req, res) => res.json(db.sites));
+
 app.post('/api/sites', (req, res) => {
   db.sites = req.body.sites;
   res.json({ success: true });
 });
 
-// ─── ADMIN: PROXY CHECKER ───
+// ─── PROXY HELPERS ───
+function formatProxy(proxyStr) {
+  const parts = proxyStr.trim().split(':');
+  if (parts.length === 4) return `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
+  if (parts.length === 2) return `http://${parts[0]}:${parts[1]}`;
+  return null;
+}
+
+async function testProxy(rawProxy) {
+  const formatted = formatProxy(rawProxy);
+  if (!formatted) return false;
+  try {
+    const agent = new HttpsProxyAgent(formatted);
+    await axios.get('https://api.ipify.org?format=json', { httpsAgent: agent, timeout: 10000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function filterLiveProxies(proxies) {
+  const results = await Promise.allSettled(proxies.map(p => testProxy(p)));
+  return proxies.filter((_, i) => results[i].status === 'fulfilled' && results[i].value === true);
+}
+
+// ─── ADMIN: PROXY MANAGEMENT ───
 app.get('/api/proxies', (req, res) => res.json(db.proxies));
 
 app.post('/api/check-proxies', async (req, res) => {
   const { proxies } = req.body;
   if (!proxies || !proxies.length) return res.json({ success: true, live: 0, total: db.proxies.length });
 
-  let liveProxies = [];
-
-  const formatProxy = (proxyStr) => {
-    const parts = proxyStr.trim().split(':');
-    if (parts.length === 4) return `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
-    if (parts.length === 2) return `http://${parts[0]}:${parts[1]}`;
-    return null;
-  };
-
-  const checkProxy = async (rawProxy) => {
-    const formatted = formatProxy(rawProxy);
-    if (!formatted) return;
-    try {
-      const agent = new HttpsProxyAgent(formatted);
-      await axios.get('https://api.ipify.org?format=json', { httpsAgent: agent, timeout: 10000 });
-      liveProxies.push(rawProxy);
-    } catch (err) {
-      // failed, skip
-    }
-  };
-
-  await Promise.allSettled(proxies.map(p => checkProxy(p)));
-
+  const liveProxies = await filterLiveProxies(proxies);
   db.proxies = [...new Set([...db.proxies, ...liveProxies])];
 
   res.json({ success: true, live: liveProxies.length, total: db.proxies.length });
+});
+
+app.post('/api/recheck-proxies', async (req, res) => {
+  if (!db.proxies.length) return res.json({ success: true, live: 0, total: 0, removed: 0 });
+
+  const before = db.proxies.length;
+  const liveProxies = await filterLiveProxies(db.proxies);
+  db.proxies = liveProxies;
+
+  res.json({
+    success: true,
+    live: liveProxies.length,
+    total: db.proxies.length,
+    removed: before - liveProxies.length
+  });
+});
+
+app.delete('/api/proxies', (req, res) => {
+  const { proxy } = req.body;
+  if (!proxy) return res.status(400).json({ error: 'Proxy required' });
+  const before = db.proxies.length;
+  db.proxies = db.proxies.filter(p => p !== proxy);
+  res.json({ success: true, removed: before - db.proxies.length, total: db.proxies.length });
 });
 
 // ─── MAIN CHECKER ───
@@ -113,7 +140,7 @@ app.get('/api/check', async (req, res) => {
   }
 });
 
-// ─── REPORTING ───
+// ─── REPORTING & INBOX ───
 app.post('/api/report', (req, res) => {
   const { user, cc, message } = req.body;
   db.inbox.unshift({ user, cc, message, time: new Date().toISOString() });
@@ -133,11 +160,9 @@ app.get('/api/admin/data', (req, res) => {
   res.json({ inbox: db.inbox, activity: db.activity });
 });
 
-app.get('/api/health', (req, res) => res.json({ status: 'ok', name: 'OGGY SHOPIFY WEB' }));
-
 // ─── SERVE FRONTEND ───
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-app.listen(PORT, () => console.log(`OGGY SHOPIFY WEB running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
