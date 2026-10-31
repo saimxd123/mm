@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const axios = require('axios');
-const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -65,85 +64,19 @@ app.post('/api/sites', (req, res) => {
   res.json({ success: true });
 });
 
-// ─── BULLETPROOF PROXY CHECKER ───
-async function testProxy(proxyStr) {
-  const parts = proxyStr.trim().split(':');
-  if (parts.length !== 2 && parts.length !== 4) {
-    console.log(`[Proxy Fail] Invalid format: ${proxyStr}`);
-    return false;
-  }
-
-  // Build the proxy URL for the agent
-  let proxyUrl = '';
-  if (parts.length === 4) {
-    proxyUrl = `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
-  } else {
-    proxyUrl = `http://${parts[0]}:${parts[1]}`;
-  }
-
-  try {
-    const agent = new HttpsProxyAgent(proxyUrl);
-    
-    // Test against a fast endpoint
-    const response = await axios.get('https://api.ipify.org?format=json', {
-      httpsAgent: agent,
-      timeout: 15000 // 15 seconds max
-    });
-    
-    if (response.status === 200) {
-      console.log(`[Proxy OK] ${proxyStr}`);
-      return true;
-    }
-    return false;
-  } catch (err) {
-    console.log(`[Proxy Fail] ${proxyStr} - Reason: ${err.message}`);
-    return false;
-  }
-}
-
 // ─── ADMIN: PROXY MANAGEMENT ───
 app.get('/api/proxies', (req, res) => res.json(db.proxies));
 
-app.post('/api/check-proxies', async (req, res) => {
+// Simply save the proxies, no testing
+app.post('/api/proxies', (req, res) => {
   const { proxies } = req.body;
-  if (!proxies || !proxies.length) return res.json({ success: true, live: 0, total: db.proxies.length });
+  if (!proxies || !proxies.length) return res.json({ success: true, total: db.proxies.length });
 
-  const liveProxies = [];
+  // Filter out empty lines and merge with existing (avoiding duplicates)
+  const cleanProxies = proxies.map(p => p.trim()).filter(p => p.length > 3);
+  db.proxies = [...new Set([...db.proxies, ...cleanProxies])];
   
-  // Check in batches of 20 to prevent Render free tier from crashing
-  for (let i = 0; i < proxies.length; i += 20) {
-    const batch = proxies.slice(i, i + 20);
-    const results = await Promise.all(batch.map(p => testProxy(p)));
-    results.forEach((isLive, index) => {
-      if (isLive) liveProxies.push(batch[index]);
-    });
-  }
-
-  db.proxies = [...new Set([...db.proxies, ...liveProxies])];
-  res.json({ success: true, live: liveProxies.length, total: db.proxies.length });
-});
-
-app.post('/api/recheck-proxies', async (req, res) => {
-  if (!db.proxies.length) return res.json({ success: true, live: 0, total: 0, removed: 0 });
-
-  const before = db.proxies.length;
-  const liveProxies = [];
-  
-  for (let i = 0; i < db.proxies.length; i += 20) {
-    const batch = db.proxies.slice(i, i + 20);
-    const results = await Promise.all(batch.map(p => testProxy(p)));
-    results.forEach((isLive, index) => {
-      if (isLive) liveProxies.push(batch[index]);
-    });
-  }
-
-  db.proxies = liveProxies;
-  res.json({
-    success: true,
-    live: liveProxies.length,
-    total: db.proxies.length,
-    removed: before - liveProxies.length
-  });
+  res.json({ success: true, added: cleanProxies.length, total: db.proxies.length });
 });
 
 app.delete('/api/proxies', (req, res) => {
@@ -154,11 +87,12 @@ app.delete('/api/proxies', (req, res) => {
   res.json({ success: true, removed: before - db.proxies.length, total: db.proxies.length });
 });
 
-// ─── MAIN CHECKER (Core Logic) ───
+// ─── MAIN CHECKER (Rotates Site & Proxy per card) ───
 app.get('/api/check', async (req, res) => {
   const { cc } = req.query;
   if (!cc) return res.status(400).json({ error: 'Missing CC' });
 
+  // ROTATION LOGIC: Pick a random site and random proxy for THIS SPECIFIC card
   const site = db.sites.length > 0 ? db.sites[Math.floor(Math.random() * db.sites.length)] : 'shopify.com';
   const proxy = db.proxies.length > 0 ? db.proxies[Math.floor(Math.random() * db.proxies.length)] : '';
 
@@ -176,8 +110,9 @@ app.get('/api/check', async (req, res) => {
     const response = await axios.get(targetUrl.toString(), { timeout: 25000 });
     res.json(response.data);
   } catch (err) {
-    console.error(`[API Error] ${err.message}`);
-    res.status(500).json({ status: 'unknown', message: 'API connection failed' });
+    let errorMsg = err.message;
+    if (err.response) errorMsg = `API Rejected: HTTP ${err.response.status}`;
+    res.status(500).json({ status: 'unknown', message: errorMsg });
   }
 });
 
