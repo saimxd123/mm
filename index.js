@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const axios = require('axios');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,7 +13,7 @@ app.use(express.static(__dirname));
 
 // ─── GLOBAL MEMORY DATABASE ───
 const db = {
-  apiKey: '', // Stores the yzio API key
+  apiKey: '', 
   users: [
     { email: 'yousafcodes.de@gmail.com', pass: 'YOUSAFCODES.DE', role: 'admin', name: 'Oggy Admin', status: 'active' }
   ],
@@ -59,35 +60,43 @@ app.post('/api/settings', (req, res) => {
 
 // ─── ADMIN: SITES MANAGEMENT ───
 app.get('/api/sites', (req, res) => res.json(db.sites));
-
 app.post('/api/sites', (req, res) => {
   db.sites = req.body.sites;
   res.json({ success: true });
 });
 
-// ─── PROXY HELPERS ───
+// ─── BULLETPROOF PROXY CHECKER ───
 async function testProxy(proxyStr) {
   const parts = proxyStr.trim().split(':');
-  if (parts.length !== 2 && parts.length !== 4) return false;
-  
-  const proxyConfig = {
-    host: parts[0],
-    port: parseInt(parts[1], 10),
-    protocol: 'http'
-  };
-  
+  if (parts.length !== 2 && parts.length !== 4) {
+    console.log(`[Proxy Fail] Invalid format: ${proxyStr}`);
+    return false;
+  }
+
+  // Build the proxy URL for the agent
+  let proxyUrl = '';
   if (parts.length === 4) {
-    proxyConfig.auth = { username: parts[2], password: parts[3] };
+    proxyUrl = `http://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
+  } else {
+    proxyUrl = `http://${parts[0]}:${parts[1]}`;
   }
 
   try {
-    // Use Axios native proxy support (much more stable on Render)
+    const agent = new HttpsProxyAgent(proxyUrl);
+    
+    // Test against a fast endpoint
     const response = await axios.get('https://api.ipify.org?format=json', {
-      proxy: proxyConfig,
-      timeout: 10000
+      httpsAgent: agent,
+      timeout: 15000 // 15 seconds max
     });
-    return response.status === 200;
+    
+    if (response.status === 200) {
+      console.log(`[Proxy OK] ${proxyStr}`);
+      return true;
+    }
+    return false;
   } catch (err) {
+    console.log(`[Proxy Fail] ${proxyStr} - Reason: ${err.message}`);
     return false;
   }
 }
@@ -101,16 +110,15 @@ app.post('/api/check-proxies', async (req, res) => {
 
   const liveProxies = [];
   
-  // Check proxies in batches of 50 to prevent Render from timing out or crashing
-  for (let i = 0; i < proxies.length; i += 50) {
-    const batch = proxies.slice(i, i + 50);
+  // Check in batches of 20 to prevent Render free tier from crashing
+  for (let i = 0; i < proxies.length; i += 20) {
+    const batch = proxies.slice(i, i + 20);
     const results = await Promise.all(batch.map(p => testProxy(p)));
     results.forEach((isLive, index) => {
       if (isLive) liveProxies.push(batch[index]);
     });
   }
 
-  // Save only the unique live proxies
   db.proxies = [...new Set([...db.proxies, ...liveProxies])];
   res.json({ success: true, live: liveProxies.length, total: db.proxies.length });
 });
@@ -121,8 +129,8 @@ app.post('/api/recheck-proxies', async (req, res) => {
   const before = db.proxies.length;
   const liveProxies = [];
   
-  for (let i = 0; i < db.proxies.length; i += 50) {
-    const batch = db.proxies.slice(i, i + 50);
+  for (let i = 0; i < db.proxies.length; i += 20) {
+    const batch = db.proxies.slice(i, i + 20);
     const results = await Promise.all(batch.map(p => testProxy(p)));
     results.forEach((isLive, index) => {
       if (isLive) liveProxies.push(batch[index]);
@@ -146,11 +154,10 @@ app.delete('/api/proxies', (req, res) => {
   res.json({ success: true, removed: before - db.proxies.length, total: db.proxies.length });
 });
 
-// ─── MAIN CHECKER ───
+// ─── MAIN CHECKER (Core Logic) ───
 app.get('/api/check', async (req, res) => {
   const { cc } = req.query;
   if (!cc) return res.status(400).json({ error: 'Missing CC' });
-  if (!db.apiKey) return res.status(400).json({ status: 'unknown', message: 'Admin API Key not set' });
 
   const site = db.sites.length > 0 ? db.sites[Math.floor(Math.random() * db.sites.length)] : 'shopify.com';
   const proxy = db.proxies.length > 0 ? db.proxies[Math.floor(Math.random() * db.proxies.length)] : '';
@@ -158,13 +165,18 @@ app.get('/api/check', async (req, res) => {
   const targetUrl = new URL('https://check.yzio.app/shopify');
   targetUrl.searchParams.append('site', site);
   targetUrl.searchParams.append('cc', cc);
-  targetUrl.searchParams.append('key', db.apiKey); // Inject API Key
+  
+  if (db.apiKey && db.apiKey.trim() !== '') {
+    targetUrl.searchParams.append('key', db.apiKey.trim());
+  }
+  
   if (proxy) targetUrl.searchParams.append('proxy', proxy);
 
   try {
     const response = await axios.get(targetUrl.toString(), { timeout: 25000 });
     res.json(response.data);
   } catch (err) {
+    console.error(`[API Error] ${err.message}`);
     res.status(500).json({ status: 'unknown', message: 'API connection failed' });
   }
 });
