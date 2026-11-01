@@ -26,6 +26,9 @@ const db = {
   tasks: {} // Store background tasks per user
 };
 
+// ─── HEALTH CHECK (For Render/UptimeRobot) ───
+app.get('/api/health', (req, res) => res.send('OK'));
+
 // ─── BULLETPROOF PROXY FORMATTER ───
 function formatProxy(proxyStr) {
   if (!proxyStr) return null;
@@ -70,7 +73,7 @@ app.post('/api/settings', (req, res) => {
   res.json({ success: true });
 });
 
-// ─── ADMIN: SITE CHECKER ───
+// ─── ADMIN: FAST SITE CHECKER ───
 app.get('/api/sites', (req, res) => res.json(db.sites));
 
 app.post('/api/check-sites', async (req, res) => {
@@ -141,7 +144,7 @@ app.delete('/api/sites', (req, res) => {
   res.json({ success: true, removed: before - db.sites.length, total: db.sites.length });
 });
 
-// ─── ADMIN: PROXY CHECKER ───
+// ─── ADMIN: FAST PROXY CHECKER ───
 app.get('/api/proxies', (req, res) => res.json(db.proxies));
 
 app.post('/api/check-proxies', async (req, res) => {
