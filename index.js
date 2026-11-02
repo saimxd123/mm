@@ -93,7 +93,6 @@ app.post('/api/check-proxies', async (req, res) => {
 
   liveProxies.sort((a, b) => a.ms - b.ms);
   
-  // Auto-save live proxies
   const newProxies = liveProxies.map(p => p.proxy);
   db.proxies = [...new Set([...db.proxies, ...newProxies])];
   
@@ -131,6 +130,7 @@ app.post('/api/check-sites-advanced', async (req, res) => {
       }
 
       try {
+        // 1. Check Stock & Prices
         const prodRes = await axios.get(`https://${domain}/products.json?limit=250`, options);
         if (prodRes.status === 200 && prodRes.data && Array.isArray(prodRes.data.products)) {
           let availableVariants = [];
@@ -139,7 +139,10 @@ app.post('/api/check-sites-advanced', async (req, res) => {
             if (prod.variants) {
               prod.variants.forEach(v => {
                 const price = parseFloat(v.price);
-                if (v.available === true && v.inventory_quantity > 0) {
+                // Fixed: Accept if available is true, inventory is positive, OR inventory is undefined
+                const isAvailable = v.available === true || v.inventory_quantity > 0 || v.inventory_quantity === undefined;
+                
+                if (isAvailable) {
                   availableVariants.push({ price, id: v.id });
                 }
                 if (!isNaN(price) && price > 0) {
@@ -150,23 +153,32 @@ app.post('/api/check-sites-advanced', async (req, res) => {
             }
           });
 
-          // 1. Check Stock
           if (availableVariants.length === 0) return; // Dead if no stock
           stock = true;
           availableVariants.sort((a, b) => a.price - b.price);
-          const lowestVariant = availableVariants[0];
 
           // 2. Check Checkout & Payment Methods
           try {
             const checkoutRes = await axios.get(`https://${domain}/checkout`, options);
-            const html = String(checkoutRes.data).toLowerCase();
+            const checkoutHtml = String(checkoutRes.data).toLowerCase();
             checkout = true;
-            if (html.includes('credit_card') || html.includes('credit card') || html.includes('"card"') || html.includes('shopify_payments') || html.includes('stripe')) {
+            if (checkoutHtml.includes('credit_card') || checkoutHtml.includes('credit card') || checkoutHtml.includes('"card"') || checkoutHtml.includes('shopify_payments') || checkoutHtml.includes('stripe') || checkoutHtml.includes('visa') || checkoutHtml.includes('mastercard')) {
               cardPayment = true;
             }
           } catch(e) {}
 
-          if (!checkout || !cardPayment) return; // Dead if no checkout/card payment
+          // Fallback: Check Homepage for payment icons
+          if (!cardPayment) {
+            try {
+              const homeRes = await axios.get(`https://${domain}`, options);
+              const homeHtml = String(homeRes.data).toLowerCase();
+              if (homeHtml.includes('visa') || homeHtml.includes('mastercard') || homeHtml.includes('amex') || homeHtml.includes('stripe') || homeHtml.includes('shopify_payments')) {
+                cardPayment = true;
+              }
+            } catch(e) {}
+          }
+
+          if (!checkout || !cardPayment) return; // Dead if no checkout or card payment
 
           // 3. Check GraphQL & Captcha
           try { const gql = await axios.post(`https://${domain}/api/graphql`, { query: '{ shop { name } }' }, options); if (gql.status === 200 && gql.data) graphql = true; } catch(e) {}
@@ -181,15 +193,14 @@ app.post('/api/check-sites-advanced', async (req, res) => {
       } catch (err) {}
 
       if (isLive) {
-        const siteData = { domain, minPrice: lowestVariant.price.toFixed(2), maxPrice: maxSitePrice.toFixed(2), graphql, checkout, captcha, stock, cardPayment };
+        const siteData = { domain, minPrice: minSitePrice.toFixed(2), maxPrice: maxSitePrice.toFixed(2), graphql, checkout, captcha, stock, cardPayment };
         
-        if (lowestVariant.price >= minPrice && lowestVariant.price <= maxPrice) {
+        if (minSitePrice >= minPrice && minSitePrice <= maxPrice) {
           cleanSites.push(siteData);
-          // Auto-save clean site
           if (!db.sites.find(x => x.domain === domain)) {
             db.sites.push({ domain: domain, price: siteData.minPrice, currency: 'USD' });
           }
-        } else if (lowestVariant.price > maxPrice) {
+        } else if (minSitePrice > maxPrice) {
           upperSites.push(siteData);
         }
       }
