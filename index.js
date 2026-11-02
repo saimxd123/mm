@@ -107,12 +107,14 @@ app.delete('/api/proxies', (req, res) => {
   res.json({ success: true, total: db.proxies.length });
 });
 
-// ─── ADVANCED SITE CHECKER (Auto-saves clean sites) ───
+// ─── SITE CHECKER (BOTH SCRAPE & API) ───
+
+// 1. The standard Scrape Checker (Products.json)
 app.post('/api/check-sites-advanced', async (req, res) => {
   const { sites, minPrice, maxPrice } = req.body;
-  if (!sites || !sites.length) return res.json({ success: true, cleanSites: [], upperSites: [] });
+  if (!sites || !sites.length) return res.json({ success: true, cleanSites: [] });
 
-  const cleanSites = [], upperSites = [];
+  const cleanSites = [];
   
   for (let i = 0; i < sites.length; i += 3) { 
     const batch = sites.slice(i, i + 3);
@@ -130,7 +132,6 @@ app.post('/api/check-sites-advanced', async (req, res) => {
       }
 
       try {
-        // 1. Check Stock & Prices
         const prodRes = await axios.get(`https://${domain}/products.json?limit=250`, options);
         if (prodRes.status === 200 && prodRes.data && Array.isArray(prodRes.data.products)) {
           let availableVariants = [];
@@ -139,12 +140,8 @@ app.post('/api/check-sites-advanced', async (req, res) => {
             if (prod.variants) {
               prod.variants.forEach(v => {
                 const price = parseFloat(v.price);
-                // Fixed: Accept if available is true, inventory is positive, OR inventory is undefined
-                const isAvailable = v.available === true || v.inventory_quantity > 0 || v.inventory_quantity === undefined;
-                
-                if (isAvailable) {
-                  availableVariants.push({ price, id: v.id });
-                }
+                const isAvailable = v.available === true || v.inventory_quantity > 0 || v.inventory_quantity === undefined || v.inventory_quantity === null;
+                if (isAvailable) availableVariants.push({ price, id: v.id });
                 if (!isNaN(price) && price > 0) {
                   if (price < minSitePrice) minSitePrice = price;
                   if (price > maxSitePrice) maxSitePrice = price;
@@ -153,60 +150,92 @@ app.post('/api/check-sites-advanced', async (req, res) => {
             }
           });
 
-          if (availableVariants.length === 0) return; // Dead if no stock
+          if (availableVariants.length === 0) return; 
           stock = true;
           availableVariants.sort((a, b) => a.price - b.price);
 
-          // 2. Check Checkout & Payment Methods
           try {
-            const checkoutRes = await axios.get(`https://${domain}/checkout`, options);
-            const checkoutHtml = String(checkoutRes.data).toLowerCase();
-            checkout = true;
-            if (checkoutHtml.includes('credit_card') || checkoutHtml.includes('credit card') || checkoutHtml.includes('"card"') || checkoutHtml.includes('shopify_payments') || checkoutHtml.includes('stripe') || checkoutHtml.includes('visa') || checkoutHtml.includes('mastercard')) {
-              cardPayment = true;
+            const homeRes = await axios.get(`https://${domain}`, options);
+            const homeHtml = String(homeRes.data).toLowerCase();
+            if (homeHtml.includes('visa') || homeHtml.includes('mastercard') || homeHtml.includes('amex') || homeHtml.includes('stripe') || homeHtml.includes('shopify_payments') || homeHtml.includes('credit_card') || homeHtml.includes('"card"')) {
+              cardPayment = true; checkout = true;
             }
+            if (homeHtml.includes('hcaptcha') || homeHtml.includes('recaptcha') || homeHtml.includes('captcha')) captcha = true;
           } catch(e) {}
 
-          // Fallback: Check Homepage for payment icons
-          if (!cardPayment) {
-            try {
-              const homeRes = await axios.get(`https://${domain}`, options);
-              const homeHtml = String(homeRes.data).toLowerCase();
-              if (homeHtml.includes('visa') || homeHtml.includes('mastercard') || homeHtml.includes('amex') || homeHtml.includes('stripe') || homeHtml.includes('shopify_payments')) {
-                cardPayment = true;
-              }
-            } catch(e) {}
-          }
-
-          if (!checkout || !cardPayment) return; // Dead if no checkout or card payment
-
-          // 3. Check GraphQL & Captcha
+          if (!checkout || !cardPayment) return; 
           try { const gql = await axios.post(`https://${domain}/api/graphql`, { query: '{ shop { name } }' }, options); if (gql.status === 200 && gql.data) graphql = true; } catch(e) {}
-          try {
-            const html = await axios.get(`https://${domain}`, options);
-            const body = String(html.data).toLowerCase();
-            if (body.includes('hcaptcha') || body.includes('recaptcha') || body.includes('captcha')) captcha = true;
-          } catch(e) {}
 
           isLive = true;
         }
       } catch (err) {}
 
-      if (isLive) {
-        const siteData = { domain, minPrice: minSitePrice.toFixed(2), maxPrice: maxSitePrice.toFixed(2), graphql, checkout, captcha, stock, cardPayment };
-        
-        if (minSitePrice >= minPrice && minSitePrice <= maxPrice) {
-          cleanSites.push(siteData);
-          if (!db.sites.find(x => x.domain === domain)) {
-            db.sites.push({ domain: domain, price: siteData.minPrice, currency: 'USD' });
-          }
-        } else if (minSitePrice > maxPrice) {
-          upperSites.push(siteData);
-        }
+      if (isLive && minSitePrice >= minPrice && minSitePrice <= maxPrice) {
+        cleanSites.push({ domain, price: minSitePrice.toFixed(2), method: 'Scrape', graphql, checkout, captcha });
       }
     }));
   }
-  res.json({ success: true, cleanSites, upperSites });
+  res.json({ success: true, cleanSites });
+});
+
+// 2. The new API Checker (Uses yzio.app API with generated test card)
+app.post('/api/check-sites-api', async (req, res) => {
+  const { sites, minPrice, maxPrice } = req.body;
+  if (!sites || !sites.length) return res.json({ success: true, cleanSites: [] });
+
+  const cleanSites = [];
+  const testCard = '4111111111111111|12|2030|123'; // Standard test card
+  
+  for (let i = 0; i < sites.length; i += 5) { // API handles slightly faster
+    const batch = sites.slice(i, i + 5);
+    await Promise.all(batch.map(async (s) => {
+      let domain = s.trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+      if (!domain) return;
+
+      let proxyStr = db.proxies.length > 0 ? db.proxies[Math.floor(Math.random() * db.proxies.length)] : null;
+      let options = { timeout: 15000 };
+      
+      const targetUrl = new URL('https://check.yzio.app/shopify');
+      targetUrl.searchParams.append('site', domain);
+      targetUrl.searchParams.append('cc', testCard);
+      if (db.apiKey) targetUrl.searchParams.append('key', db.apiKey.trim());
+      
+      if (proxyStr) {
+        const formatted = formatProxy(proxyStr);
+        if (formatted) options.httpsAgent = new HttpsProxyAgent(formatted);
+        targetUrl.searchParams.append('proxy', proxyStr);
+      }
+
+      try {
+        const response = await axios.get(targetUrl.toString(), options);
+        const data = response.data;
+        
+        // The API returns a Price field for the site
+        const sitePrice = parseFloat(data.Price);
+        if (!isNaN(sitePrice) && sitePrice > 0) {
+          if (sitePrice >= minPrice && sitePrice <= maxPrice) {
+            cleanSites.push({ domain, price: sitePrice.toFixed(2), method: 'API' });
+          }
+        }
+      } catch (err) {}
+    }));
+  }
+  res.json({ success: true, cleanSites });
+});
+
+// Save Sites (Import to Config)
+app.post('/api/save-sites', (req, res) => {
+  const { sites } = req.body;
+  if (!sites || !sites.length) return res.json({ success: true, total: db.sites.length });
+  
+  sites.forEach(newSite => {
+    const domain = newSite.domain || newSite; // handle string or object
+    const price = newSite.price || 'N/A';
+    if (!db.sites.find(x => x.domain === domain)) {
+      db.sites.push({ domain, price, currency: 'USD' });
+    }
+  });
+  res.json({ success: true, total: db.sites.length });
 });
 
 app.get('/api/sites', (req, res) => res.json(db.sites));
