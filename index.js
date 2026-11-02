@@ -22,13 +22,11 @@ const db = {
   inbox: [],
   activity: [],
   tasks: {},
-  proxyIndex: 0 // For strict rotation
+  proxyIndex: 0
 };
 
-// ─── HEALTH CHECK ───
 app.get('/api/health', (req, res) => res.send('OK'));
 
-// ─── BULLETPROOF PROXY FORMATTER ───
 function formatProxy(proxyStr) {
   if (!proxyStr) return null;
   let p = proxyStr.trim();
@@ -40,14 +38,13 @@ function formatProxy(proxyStr) {
   return `http://${p}`;
 }
 
-// ─── AUTH & USER MANAGEMENT ───
+// ─── AUTH & USERS ───
 app.post('/api/login', (req, res) => {
   const { email, password } = req.body;
   const user = db.users.find(u => u.email === email && u.pass === password && u.status === 'active');
   if (user) res.json({ user: { email: user.email, name: user.name, role: user.role } });
   else res.status(401).json({ error: 'Invalid credentials' });
 });
-
 app.get('/api/users', (req, res) => res.json(db.users));
 app.post('/api/register', (req, res) => {
   const { email, password, name, role } = req.body;
@@ -65,14 +62,14 @@ app.post('/api/user/delete', (req, res) => {
   res.json({ success: true });
 });
 
-// ─── ADMIN: SETTINGS ───
+// ─── SETTINGS ───
 app.get('/api/settings', (req, res) => res.json({ apiKey: db.apiKey }));
 app.post('/api/settings', (req, res) => {
   db.apiKey = req.body.apiKey || '';
   res.json({ success: true });
 });
 
-// ─── PROXY CHECKER & SAVER ───
+// ─── PROXY CHECKER (Auto-saves live proxies) ───
 app.post('/api/check-proxies', async (req, res) => {
   const { proxies } = req.body;
   if (!proxies || !proxies.length) return res.json({ success: true, live: [] });
@@ -95,15 +92,12 @@ app.post('/api/check-proxies', async (req, res) => {
   }
 
   liveProxies.sort((a, b) => a.ms - b.ms);
+  
+  // Auto-save live proxies
+  const newProxies = liveProxies.map(p => p.proxy);
+  db.proxies = [...new Set([...db.proxies, ...newProxies])];
+  
   res.json({ success: true, live: liveProxies });
-});
-
-app.post('/api/save-proxies', (req, res) => {
-  const { proxies } = req.body;
-  if (!proxies || !proxies.length) return res.json({ success: true, total: db.proxies.length });
-  const clean = proxies.map(p => p.trim()).filter(p => p.length > 3);
-  db.proxies = [...new Set([...db.proxies, ...clean])];
-  res.json({ success: true, total: db.proxies.length });
 });
 
 app.get('/api/proxies', (req, res) => res.json(db.proxies));
@@ -114,29 +108,7 @@ app.delete('/api/proxies', (req, res) => {
   res.json({ success: true, total: db.proxies.length });
 });
 
-// ─── SITES SAVER & ADVANCED CHECKER ───
-app.post('/api/save-sites', (req, res) => {
-  const { sites } = req.body;
-  if (!sites || !sites.length) return res.json({ success: true, total: db.sites.length });
-  
-  sites.forEach(s => {
-    let domain = s.trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
-    if (!domain) return;
-    if (!db.sites.find(x => x.domain === domain)) {
-      db.sites.push({ domain: domain, price: 'N/A', currency: 'USD' });
-    }
-  });
-  res.json({ success: true, total: db.sites.length });
-});
-
-app.get('/api/sites', (req, res) => res.json(db.sites));
-app.delete('/api/sites', (req, res) => {
-  const { domain } = req.body;
-  if (!domain) return res.status(400).json({ error: 'Domain required' });
-  db.sites = db.sites.filter(s => s.domain !== domain);
-  res.json({ success: true, total: db.sites.length });
-});
-
+// ─── ADVANCED SITE CHECKER (Auto-saves clean sites) ───
 app.post('/api/check-sites-advanced', async (req, res) => {
   const { sites, minPrice, maxPrice } = req.body;
   if (!sites || !sites.length) return res.json({ success: true, cleanSites: [], upperSites: [] });
@@ -150,9 +122,9 @@ app.post('/api/check-sites-advanced', async (req, res) => {
       if (!domain) return;
       
       let proxyStr = db.proxies.length > 0 ? db.proxies[Math.floor(Math.random() * db.proxies.length)] : null;
-      let isLive = false, minSitePrice = Infinity, maxSitePrice = 0, graphql = false, checkout = false, captcha = false;
+      let isLive = false, minSitePrice = Infinity, maxSitePrice = 0, graphql = false, checkout = false, captcha = false, stock = false, cardPayment = false;
 
-      const options = { timeout: 8000, validateStatus: () => true };
+      const options = { timeout: 10000, validateStatus: () => true };
       if (proxyStr) {
         const formatted = formatProxy(proxyStr);
         if (formatted) options.httpsAgent = new HttpsProxyAgent(formatted);
@@ -161,40 +133,80 @@ app.post('/api/check-sites-advanced', async (req, res) => {
       try {
         const prodRes = await axios.get(`https://${domain}/products.json?limit=250`, options);
         if (prodRes.status === 200 && prodRes.data && Array.isArray(prodRes.data.products)) {
-          isLive = true;
+          let availableVariants = [];
+          
           prodRes.data.products.forEach(prod => {
             if (prod.variants) {
               prod.variants.forEach(v => {
-                const p = parseFloat(v.price);
-                if (!isNaN(p) && p > 0) {
-                  if (p < minSitePrice) minSitePrice = p;
-                  if (p > maxSitePrice) maxSitePrice = p;
+                const price = parseFloat(v.price);
+                if (v.available === true && v.inventory_quantity > 0) {
+                  availableVariants.push({ price, id: v.id });
+                }
+                if (!isNaN(price) && price > 0) {
+                  if (price < minSitePrice) minSitePrice = price;
+                  if (price > maxSitePrice) maxSitePrice = price;
                 }
               });
             }
           });
+
+          // 1. Check Stock
+          if (availableVariants.length === 0) return; // Dead if no stock
+          stock = true;
+          availableVariants.sort((a, b) => a.price - b.price);
+          const lowestVariant = availableVariants[0];
+
+          // 2. Check Checkout & Payment Methods
+          try {
+            const checkoutRes = await axios.get(`https://${domain}/checkout`, options);
+            const html = String(checkoutRes.data).toLowerCase();
+            checkout = true;
+            if (html.includes('credit_card') || html.includes('credit card') || html.includes('"card"') || html.includes('shopify_payments') || html.includes('stripe')) {
+              cardPayment = true;
+            }
+          } catch(e) {}
+
+          if (!checkout || !cardPayment) return; // Dead if no checkout/card payment
+
+          // 3. Check GraphQL & Captcha
           try { const gql = await axios.post(`https://${domain}/api/graphql`, { query: '{ shop { name } }' }, options); if (gql.status === 200 && gql.data) graphql = true; } catch(e) {}
-          try { const chk = await axios.get(`https://${domain}/cart`, options); if (chk.status === 200) checkout = true; } catch(e) {}
           try {
             const html = await axios.get(`https://${domain}`, options);
             const body = String(html.data).toLowerCase();
             if (body.includes('hcaptcha') || body.includes('recaptcha') || body.includes('captcha')) captcha = true;
           } catch(e) {}
+
+          isLive = true;
         }
       } catch (err) {}
 
       if (isLive) {
-        const siteData = { domain, minPrice: minSitePrice === Infinity ? 0 : minSitePrice.toFixed(2), maxPrice: maxSitePrice.toFixed(2), graphql, checkout, captcha };
-        const siteMin = minSitePrice === Infinity ? 0 : minSitePrice;
-        if (siteMin >= minPrice && siteMin <= maxPrice) cleanSites.push(siteData);
-        else if (siteMin > maxPrice) upperSites.push(siteData);
+        const siteData = { domain, minPrice: lowestVariant.price.toFixed(2), maxPrice: maxSitePrice.toFixed(2), graphql, checkout, captcha, stock, cardPayment };
+        
+        if (lowestVariant.price >= minPrice && lowestVariant.price <= maxPrice) {
+          cleanSites.push(siteData);
+          // Auto-save clean site
+          if (!db.sites.find(x => x.domain === domain)) {
+            db.sites.push({ domain: domain, price: siteData.minPrice, currency: 'USD' });
+          }
+        } else if (lowestVariant.price > maxPrice) {
+          upperSites.push(siteData);
+        }
       }
     }));
   }
   res.json({ success: true, cleanSites, upperSites });
 });
 
-// ─── BACKGROUND TASK SYSTEM (CARDS) ───
+app.get('/api/sites', (req, res) => res.json(db.sites));
+app.delete('/api/sites', (req, res) => {
+  const { domain } = req.body;
+  if (!domain) return res.status(400).json({ error: 'Domain required' });
+  db.sites = db.sites.filter(s => s.domain !== domain);
+  res.json({ success: true, total: db.sites.length });
+});
+
+// ─── BACKGROUND TASK SYSTEM ───
 app.post('/api/start-task', (req, res) => {
   const { email, cards } = req.body;
   if (!email || !cards || !cards.length) return res.status(400).json({ error: 'Missing data' });
@@ -207,7 +219,6 @@ app.post('/api/start-task', (req, res) => {
 
 app.get('/api/task-status', (req, res) => {
   const email = req.query.email;
-  if (!email) return res.status(400).json({ error: 'Missing email' });
   const task = db.tasks[email];
   if (!task) return res.json({ active: false });
   res.json({ active: task.status === 'running', task });
@@ -219,7 +230,6 @@ app.post('/api/stop-task', (req, res) => {
   res.json({ success: true });
 });
 
-// Strict Round-Robin Proxy Rotation
 function getNextProxy() {
   if (db.proxies.length === 0) return null;
   const proxy = db.proxies[db.proxyIndex % db.proxies.length];
@@ -256,7 +266,7 @@ async function checkCardWithRetry(cc) {
       return { success: true, data };
     } catch (err) {
       if (proxyStr && (err.code === 'ECONNABORTED' || err.message.includes('connect'))) {
-        db.proxies = db.proxies.filter(p => p !== proxyStr); // Remove dead proxy
+        db.proxies = db.proxies.filter(p => p !== proxyStr);
       }
       await new Promise(r => setTimeout(r, 1000));
     }
@@ -309,7 +319,7 @@ async function processUserTask(email) {
   task.status = 'done';
 }
 
-// ─── REPORTING & ACTIVITY ───
+// ─── REPORTING ───
 app.get('/api/admin/data', (req, res) => {
   const email = req.query.email;
   let inbox = db.inbox, activity = db.activity;
@@ -320,8 +330,5 @@ app.get('/api/admin/data', (req, res) => {
   res.json({ inbox, activity });
 });
 
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
-});
-
+app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
